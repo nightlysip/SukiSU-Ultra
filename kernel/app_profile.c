@@ -66,13 +66,6 @@ void seccomp_filter_release(struct task_struct *tsk);
 static void disable_seccomp(void)
 {
     struct task_struct *fake;
-
-    fake = kmalloc(sizeof(*fake), GFP_ATOMIC);
-    if (!fake) {
-        pr_warn("failed to alloc fake task_struct\n");
-        return;
-    }
-
     // Refer to kernel/seccomp.c: seccomp_set_mode_strict
     // When disabling Seccomp, ensure that current->sighand->siglock is held during the operation.
     spin_lock_irq(&current->sighand->siglock);
@@ -84,8 +77,17 @@ static void disable_seccomp(void)
     clear_thread_flag(TIF_SECCOMP);
 #endif
 
-    memcpy(fake, current, sizeof(*fake));
+    fake = kmalloc(sizeof(struct task_struct), GFP_ATOMIC);
+    if (!fake) {
+        pr_warn("Failed to allocate fake task_struct for seccomp release\n");
+        current->seccomp.mode = 0;
+        current->seccomp.filter = NULL;
+        atomic_set(&current->seccomp.filter_count, 0);
+        spin_unlock_irq(&current->sighand->siglock);
+        return;
+    }
 
+    memcpy(fake, current, sizeof(*fake));
     current->seccomp.mode = 0;
     current->seccomp.filter = NULL;
     atomic_set(&current->seccomp.filter_count, 0);
@@ -204,10 +206,13 @@ static int __manual_su_handle_devpts(struct inode *inode)
 static void disable_seccomp_for_task(struct task_struct *tsk)
 {
     struct task_struct *fake;
-
-    fake = kmalloc(sizeof(*fake), GFP_ATOMIC);
-    if (!fake) {
-        pr_warn("failed to alloc fake task_struct\n");
+    unsigned long flags;
+    // Refer to kernel/seccomp.c: seccomp_set_mode_strict
+    // When disabling Seccomp, ensure that tsk->sighand->siglock is held during the operation.
+    spin_lock_irqsave(&tsk->sighand->siglock, flags);
+#ifdef CONFIG_SECCOMP
+    if (tsk->seccomp.mode == SECCOMP_MODE_DISABLED && !tsk->seccomp.filter) {
+        spin_unlock_irqrestore(&tsk->sighand->siglock, flags);
         return;
     }
 
@@ -222,12 +227,30 @@ static void disable_seccomp_for_task(struct task_struct *tsk)
 #else
     clear_tsk_thread_flag(tsk, TIF_SECCOMP);
 #endif
+    // disable seccomp
+#if defined(CONFIG_GENERIC_ENTRY) &&                                           \
+    LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+    // clear_syscall_work is only for current, use clear_tsk_thread_flag for other tasks
+    clear_tsk_thread_flag(tsk, TIF_SECCOMP);
+#else
+    clear_tsk_thread_flag(tsk, TIF_SECCOMP);
+#endif
+
+    fake = kmalloc(sizeof(struct task_struct), GFP_ATOMIC);
+    if (!fake) {
+        pr_warn("Failed to allocate fake task_struct for seccomp release\n");
+        tsk->seccomp.mode = SECCOMP_MODE_DISABLED;
+        tsk->seccomp.filter = NULL;
+        atomic_set(&tsk->seccomp.filter_count, 0);
+        spin_unlock_irqrestore(&tsk->sighand->siglock, flags);
+        return;
+    }
 
     memcpy(fake, tsk, sizeof(*fake));
     tsk->seccomp.mode = SECCOMP_MODE_DISABLED;
     tsk->seccomp.filter = NULL;
     atomic_set(&tsk->seccomp.filter_count, 0);
-    spin_unlock_irq(&tsk->sighand->siglock);
+    spin_unlock_irqrestore(&tsk->sighand->siglock, flags);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
     // https://github.com/torvalds/linux/commit/bfafe5efa9754ebc991750da0bcca2a6694f3ed3#diff-45eb79a57536d8eccfc1436932f093eb5c0b60d9361c39edb46581ad313e8987R576-R577
